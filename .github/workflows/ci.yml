@@ -18,7 +18,7 @@ jobs:
     # Pull requests never execute on a production VPS runner. Manual runs and
     # pushes use the protected main ref and the app's provisioned runner label.
     if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && vars.RUNNER_LABEL != '')
-    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || format('["self-hosted","linux","{0}"]', vars.RUNNER_LABEL || 'vps-template-rust')) }}
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || format('["self-hosted","linux","{0}"]', vars.RUNNER_LABEL || 'vps-template-rust')) }}
     timeout-minutes: 30
     services:
       postgres:
