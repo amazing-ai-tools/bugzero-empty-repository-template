@@ -58,8 +58,8 @@ jobs:
         run: cargo clippy --locked -p app-api --all-targets -- -D warnings
       - name: Test API
         run: cargo test --locked -p app-api
-      - name: Test public widget configuration
-        run: cargo test --locked -p app-web --lib
+      - name: Test frontend configuration and all locales
+        run: cargo test --locked -p app-web --lib --tests
       - name: Test migrations and PostgreSQL readiness
         env:
           TEST_DATABASE_URL: postgres://template:template-test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/template_test
@@ -78,3 +78,14 @@ jobs:
           echo "$RUNNER_TEMP/trunk-bin" >> "$GITHUB_PATH"
       - name: Build WebAssembly frontend
         run: trunk build --config rust/frontend/Trunk.toml --release --locked
+      - name: Install Node for browser tests
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Test the compiled trilingual interface in Chromium
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/template-browser" --no-package-lock --no-save playwright@1.58.2
+          export NODE_PATH="$RUNNER_TEMP/template-browser/node_modules"
+          "$RUNNER_TEMP/template-browser/node_modules/.bin/playwright" install chromium
+          node tests/browser.cjs

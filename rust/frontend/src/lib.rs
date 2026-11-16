@@ -1,3 +1,5 @@
+pub mod i18n;
+
 pub fn widget_url(value: &str) -> Option<url::Url> {
     let url = url::Url::parse(value).ok()?;
     (url.scheme() == "https"
