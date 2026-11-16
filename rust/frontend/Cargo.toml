@@ -1,0 +1,12 @@
+[package]
+name = "app-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+gloo-net = { version = "0.6", features = ["http"] }
+serde = { version = "1", features = ["derive"] }
+url = "2"

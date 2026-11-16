@@ -1,0 +1,9 @@
+.git
+target
+**/dist
+.env*
+.bugzero-runtime
+deploy/.venv
+**/__pycache__
+*.log
+

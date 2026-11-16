@@ -1,0 +1,85 @@
+name: Deploy Rust app to VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact commit on main to deploy
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # The template repository itself has no APP_NAME, so it can never deploy accidentally.
+    if: ${{ github.ref == 'refs/heads/main' && vars.APP_NAME != '' && vars.RUNNER_LABEL != '' }}
+    runs-on: [self-hosted, linux, '${{ vars.RUNNER_LABEL }}']
+    timeout-minutes: 45
+    environment: production
+    env:
+      TARGET_SHA: ${{ inputs.target_sha }}
+      APP_NAME: ${{ vars.APP_NAME }}
+      APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+      APP_DISPLAY_NAME: ${{ vars.APP_DISPLAY_NAME }}
+      BUGZERO_APP_KEY: ${{ vars.BUGZERO_APP_KEY }}
+      BUGZERO_WIDGET_URL: ${{ vars.BUGZERO_WIDGET_URL }}
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate exact approved main revision and app identity
+        run: |
+          python3 - <<'PY'
+          import importlib.util, os, pathlib, re, subprocess, sys
+          revision = os.environ['TARGET_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', revision):
+              sys.exit('target_sha must be an exact lowercase Git commit SHA')
+          subprocess.run(['git', 'merge-base', '--is-ancestor', revision, 'origin/main'], check=True)
+          subprocess.run(['git', 'checkout', '--detach', revision], check=True)
+          path = pathlib.Path('deploy/deploy-vps.py')
+          spec = importlib.util.spec_from_file_location('deploy_vps', path)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          module.Config(slug=os.environ['APP_NAME'], domain=os.environ['APP_DOMAIN'],
+                        display_name=os.environ['APP_DISPLAY_NAME'], revision=revision,
+                        bugzero_app_key=os.environ['BUGZERO_APP_KEY'], bugzero_widget_url=os.environ['BUGZERO_WIDGET_URL'])
+          PY
+      - name: Verify deployment safety checks
+        run: python3 -m unittest discover -s deploy -p 'test_*.py'
+      - name: Build exact revision API and WebAssembly images on VPS
+        run: |
+          docker build --pull --file rust/backend/Dockerfile --tag "bugzero-${APP_NAME}-api:${TARGET_SHA}" .
+          docker build --pull --file rust/frontend/Dockerfile --tag "bugzero-${APP_NAME}-web:${TARGET_SHA}" .
+      - name: Back up database, migrate, and promote healthy candidate
+        run: |
+          sudo -n env APP_NAME="$APP_NAME" APP_DOMAIN="$APP_DOMAIN" APP_DISPLAY_NAME="$APP_DISPLAY_NAME" APP_REVISION="$TARGET_SHA" BUGZERO_APP_KEY="$BUGZERO_APP_KEY" BUGZERO_WIDGET_URL="$BUGZERO_WIDGET_URL" python3 deploy/deploy-vps.py
+      - name: Verify exact public release
+        run: |
+          python3 - <<'PY'
+          import json, os, time, urllib.request
+          domain, revision = os.environ['APP_DOMAIN'], os.environ['TARGET_SHA']
+          for attempt in range(30):
+              try:
+                  for route in ['/api/health/db', '/app-config.json', '/qa-release-manifest.json']:
+                      with urllib.request.urlopen(f'https://{domain}{route}', timeout=10) as response:
+                          payload = json.load(response)
+                      assert payload['revision'] == revision, 'Public release revision does not match'
+                      if route == '/api/health/db':
+                          assert payload['status'] == 'healthy', 'Public database health failed'
+                  print(f'Public frontend, API and database verified at revision {revision}')
+                  break
+              except Exception:
+                  if attempt == 29:
+                      raise
+                  time.sleep(2)
+          PY
