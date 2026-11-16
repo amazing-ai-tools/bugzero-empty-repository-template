@@ -36,6 +36,10 @@ services:
         max-size: 10m
         max-file: '3'
 networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${APP_SLOT_SUBNET:?reserved slot subnet required}
   database:
     name: bugzero-${SLUG:?app slug required}-database
     external: true
