@@ -2,6 +2,7 @@ import importlib.util
 import json
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location('deploy_vps', Path(__file__).with_name('deploy-vps.py'))
@@ -16,6 +17,88 @@ class DeploymentTests(unittest.TestCase):
         return module.Config(slug=kwargs.pop('slug', 'sample-app'), domain=kwargs.pop('domain', 'sample.example.com'),
                              display_name='Sample App', revision='a' * 40, state_root=Path(root) / 'apps',
                              sites_dir=Path(root) / 'sites', caddy_config=Path(root) / 'Caddyfile', **kwargs)
+
+    def managed_config(self, root):
+        config = self.config(root, app_id=str(uuid.uuid4()), repo_url='https://github.com/example/sample-app')
+        config.app_dir.mkdir(parents=True)
+        (config.app_dir / 'ownership.json').write_text(json.dumps({
+            'version': 1, 'stack_version': 'rust-axum-leptos-v1',
+            'app_id': config.app_id, 'app_name': config.slug, 'domain': config.domain,
+            'repo_url': config.repo_url,
+        }))
+        (config.app_dir / 'ownership.json').chmod(0o600)
+        return config
+
+    def test_managed_deploy_requires_matching_host_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.managed_config(root)
+            module.Deployment(config).preflight()
+            marker = config.app_dir / 'ownership.json'
+            owner = json.loads(marker.read_text())
+            owner['app_id'] = str(uuid.uuid4())
+            marker.write_text(json.dumps(owner))
+            commands = []
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                module.Deployment(config, runner=lambda *a, **kw: commands.append(a)).deploy()
+            self.assertEqual(commands, [])
+
+    def test_managed_deploy_never_claims_missing_host_identity(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.config(root, app_id=str(uuid.uuid4()), repo_url='https://github.com/example/sample-app')
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                module.Deployment(config).preflight()
+            self.assertFalse(config.app_dir.exists())
+
+    def test_repository_identity_is_case_insensitive(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.config(root, app_id=str(uuid.uuid4()), repo_url='https://github.com/Example/Sample-App')
+            self.assertEqual(config.repo_url, 'https://github.com/example/sample-app')
+
+    def test_retirement_blocks_deploy_before_any_side_effect(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.managed_config(root)
+            (config.app_dir / 'retirement.json').write_text('{}')
+            commands = []
+            with self.assertRaisesRegex(RuntimeError, 'retir'):
+                module.Deployment(config, runner=lambda *a, **kw: commands.append(a)).deploy()
+            self.assertEqual(commands, [])
+            self.assertFalse(config.database_env.exists())
+
+    def test_retirement_is_rechecked_after_deploy_lock(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as root:
+            config = self.managed_config(root)
+            original = module.fcntl.flock
+            def retire_at_lock(fd, operation):
+                original(fd, operation)
+                (config.app_dir / 'retirement.json').write_text('{}')
+            commands = []
+            with patch.object(module.fcntl, 'flock', side_effect=retire_at_lock):
+                with self.assertRaisesRegex(RuntimeError, 'retir'):
+                    module.Deployment(config, runner=lambda *a, **kw: commands.append(a)).deploy()
+            self.assertEqual(commands, [])
+
+    def test_retirement_is_rechecked_before_caddy_cutover(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.managed_config(root)
+            deploy = module.Deployment(config, runner=lambda *a, **kw: self.fail('Caddy changed after retirement'))
+            deploy.preflight()
+            (config.app_dir / 'retirement.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError, 'retir'):
+                deploy.switch_site(12345)
+            self.assertFalse(config.site_path.exists())
+
+    def test_symlink_or_unmanaged_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.managed_config(root)
+            unmanaged = self.config(root)
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                module.Deployment(unmanaged).preflight()
+            marker = config.app_dir / 'ownership.json'
+            marker.rename(config.app_dir / 'other.json')
+            marker.symlink_to(config.app_dir / 'other.json')
+            with self.assertRaisesRegex(RuntimeError, 'symlink'):
+                module.Deployment(config).preflight()
 
     def test_rejects_unsafe_identifiers_before_writing_files(self):
         with tempfile.TemporaryDirectory() as root:

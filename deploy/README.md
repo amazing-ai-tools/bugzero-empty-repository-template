@@ -4,7 +4,7 @@ New repositories run the Axum/Tokio/SQLx API, Leptos/WebAssembly static frontend
 
 ## Provisioning contract
 
-The provisioner configures repository variables `APP_NAME` (lowercase slug, at most 48 characters), `APP_DOMAIN` (plain DNS name), `APP_DISPLAY_NAME`, `RUNNER_LABEL`, `APP_STACK=rust-axum-leptos-v1`, `BUGZERO_APP_KEY` (public widget key), and `BUGZERO_WIDGET_URL` (HTTPS script URL). The widget settings are public frontend configuration; never put private API tokens there.
+The provisioner configures repository variables `APP_NAME` (lowercase slug, at most 48 characters), `APP_ID` (immutable BugZero UUID), `APP_REPOSITORY` (canonical GitHub URL), `APP_DOMAIN` (plain DNS name), `APP_DISPLAY_NAME`, `RUNNER_LABEL`, `APP_STACK=rust-axum-leptos-v1`, `BUGZERO_APP_KEY` (public widget key), and `BUGZERO_WIDGET_URL` (HTTPS script URL). Deployment uses the actual GitHub repository context for `APP_REPOSITORY` and requires it to match the host identity. The widget settings are public frontend configuration; never put private API tokens there.
 
 The per-app GitHub Actions runner must be Linux x86_64 on the VPS, have Docker Engine and Compose v2, Python 3.10+, and noninteractive sudo. Browser CI additionally requires the Chromium system libraries used by Playwright 1.58.2. These are already installed on the current shared provisioning VPS; new per-app runners reuse that host. When preparing a replacement VPS, install the libraries once with `npx --yes playwright@1.58.2 install-deps chromium` before enabling runners. CI installs its own pinned Node 22 toolchain and browser binary; it does not change shared system packages. VPS CI removes completed debug-profile outputs before the WebAssembly release build, then removes only its checkout's remaining generated `target` directory before installing browser tooling. This bounds retained build artifacts on the shared VPS. The compiled `rust/frontend/dist` bundle and all source files remain available for the Chromium checks; deployment state, images and database volumes are unaffected. Caddy must already import `/etc/caddy/sites/*.caddy`, and the app domain must point to this VPS. Provisioning the runner, DNS, and repository variables does not deploy existing apps.
 
@@ -17,6 +17,31 @@ Dispatch `.github/workflows/deploy.yml` manually with `target_sha` set to a full
 Each release mounts public `app-config.json` and `qa-release-manifest.json` metadata containing its exact Git revision. WebAssembly files have hashed names; runtime configuration and release metadata are never cached. The public widget key is loaded by the frontend from runtime configuration, while database credentials remain server-side.
 
 Deployment locks serialize one app's release and all Caddy reloads. An app owns only `bugzero-<slug>.caddy`, identified by a matching ownership marker. A preexisting site without that marker is rejected. The main Caddyfile and other applications' site files are never rewritten.
+
+Before registering a managed Rust runner, the authenticated Chat bridge prepares
+a root-owned `ownership.json` binding the app UUID, slug, domain and repository.
+Deployment requires this exact identity before building images and again under
+the app deployment lock. It cannot claim an unregistered state directory.
+A durable `retirement.json` permanently prevents deployment, including retries
+after a partially completed deletion. Identity and retirement markers remain
+after cleanup so an old workflow or deletion request cannot affect a new app.
+
+## App deletion and recovery data
+
+BugZero coordinates app deletion through the trusted Chat host bridge. It first
+checks and disables deployment, verifies the repository runner is idle, then
+requests app-specific host retirement. The host validates ownership, stops the
+runner and app workloads, validates a final PostgreSQL dump and archives private
+state. Only verified app-owned resources are removed: both release slots, the
+database container and volume, networks and Caddy site. BugZero then removes the
+exact owned DNS A record and GitHub runner, archives the workspace and marks the
+app and provision deleted. Failed steps remain visible for retry.
+
+Recovery data remains private under `/opt/bugzero-retired-apps/<app-id>` without
+automatic expiry and requires an explicit operator cleanup decision. App deletion
+removes live service and storage while preserving this recovery archive, its
+repository and vault. Never use global Docker prune or remove the shared Caddyfile,
+DNS resource group, registry or other applications' resources.
 
 ## Promotion and rollback
 

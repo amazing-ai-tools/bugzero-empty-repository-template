@@ -15,6 +15,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.parse
+import uuid
 
 ROOT = Path(__file__).resolve().parent
 
@@ -54,8 +55,21 @@ class Config:
     caddy_config: Path = Path('/etc/caddy/Caddyfile')
     bugzero_app_key: str = ''
     bugzero_widget_url: str = ''
+    app_id: str = ''
+    repo_url: str = ''
 
     def __post_init__(self):
+        if self.app_id or self.repo_url:
+            try:
+                if str(uuid.UUID(self.app_id)) != self.app_id:
+                    raise ValueError('Noncanonical app identity')
+            except (ValueError, AttributeError):
+                raise ValueError('APP_ID must be a canonical app UUID') from None
+            if not re.fullmatch(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}', self.repo_url):
+                raise ValueError('APP_REPOSITORY must be a canonical GitHub repository URL')
+            if self.repo_url.rsplit('/', 1)[1] in {'.', '..'} or self.repo_url.endswith('.git'):
+                raise ValueError('APP_REPOSITORY must be a canonical GitHub repository URL')
+            object.__setattr__(self, 'repo_url', self.repo_url.lower())
         if not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?', self.slug):
             raise ValueError('APP_NAME must be a lowercase app slug (1-48 characters)')
         if len(self.domain) > 253 or not re.fullmatch(r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}', self.domain):
@@ -111,9 +125,25 @@ class Deployment:
 
     def preflight(self):
         c = self.config
-        for path in [c.state_root, c.app_dir, c.database_env, c.sites_dir, c.site_path, c.recovery_marker]:
+        identity_file = c.app_dir / 'ownership.json'
+        retirement_file = c.app_dir / 'retirement.json'
+        for path in [c.state_root, c.app_dir, c.database_env, c.sites_dir, c.site_path, c.recovery_marker,
+                     identity_file, retirement_file, c.app_dir / 'deploy.lock']:
             if path.is_symlink():
                 raise RuntimeError(f'Refusing symlink path: {path}')
+        if retirement_file.exists():
+            raise RuntimeError('App retirement has started; deployment is permanently disabled for this identity')
+        if c.app_id or identity_file.exists():
+            try:
+                stat = identity_file.stat()
+                owner = json.loads(identity_file.read_text())
+            except (OSError, ValueError):
+                raise RuntimeError('Missing or invalid host ownership identity; provision the app before deployment') from None
+            expected = {'version': 1, 'stack_version': 'rust-axum-leptos-v1', 'app_id': c.app_id,
+                        'app_name': c.slug, 'domain': c.domain, 'repo_url': c.repo_url}
+            if (owner != expected or stat.st_nlink != 1 or stat.st_uid != os.geteuid()
+                    or stat.st_mode & 0o022):
+                raise RuntimeError('Host ownership identity does not match this deployment')
         if c.recovery_marker.exists():
             raise RuntimeError('Recovery required: reconcile active Caddy routing and current.json, then explicitly clear recovery-required.json before retrying')
         if c.site_path.exists() and c.site_path.read_text().splitlines()[0:1] != [c.ownership_marker]:
@@ -325,10 +355,19 @@ def main():
     os.umask(0o077)
     c = Config(slug=os.environ.get('APP_NAME', ''), domain=os.environ.get('APP_DOMAIN', ''),
                display_name=os.environ.get('APP_DISPLAY_NAME', ''), revision=os.environ.get('APP_REVISION', ''),
-               bugzero_app_key=os.environ.get('BUGZERO_APP_KEY', ''), bugzero_widget_url=os.environ.get('BUGZERO_WIDGET_URL', ''))
+               bugzero_app_key=os.environ.get('BUGZERO_APP_KEY', ''), bugzero_widget_url=os.environ.get('BUGZERO_WIDGET_URL', ''),
+               app_id=os.environ.get('APP_ID', ''), repo_url=os.environ.get('APP_REPOSITORY', ''))
+    if not c.app_id or not c.repo_url:
+        raise RuntimeError('Managed deployment requires APP_ID and APP_REPOSITORY from BugZero')
     if 'import /etc/caddy/sites/*.caddy' not in c.caddy_config.read_text():
         raise RuntimeError('VPS Caddyfile must import /etc/caddy/sites/*.caddy before app deployment')
-    Deployment(c).deploy()
+    deployment = Deployment(c)
+    if sys.argv[1:] == ['--preflight-only']:
+        deployment.preflight()
+    elif sys.argv[1:]:
+        raise RuntimeError('Unknown deployment arguments')
+    else:
+        deployment.deploy()
 
 
 if __name__ == '__main__':
