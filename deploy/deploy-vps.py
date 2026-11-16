@@ -5,10 +5,12 @@ from __future__ import annotations
 import dataclasses
 import fcntl
 import json
+import ipaddress
 import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tempfile
@@ -44,6 +46,35 @@ def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
             os.unlink(temporary)
 
 
+NETWORK_ROLES = ('database', 'blue', 'green')
+PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16'))
+
+
+def network_pool(value):
+    try:
+        pool = ipaddress.ip_network(value, strict=True)
+        if (pool.version != 4 or str(pool) != value or pool.prefixlen > 26
+                or not any(pool.subnet_of(private) for private in PRIVATE_NETWORKS)):
+            raise ValueError()
+        return pool
+    except (ValueError, TypeError):
+        raise ValueError('Network pool must be a canonical RFC1918 IPv4 subnet with room for three /28 networks') from None
+
+
+def choose_network_subnets(pool, occupied):
+    """Pure allocation; no Docker or host changes are performed here."""
+    pool = network_pool(pool)
+    occupied = [ipaddress.ip_network(value, strict=False) for value in occupied]
+    occupied = [subnet for subnet in occupied if subnet.version == 4]
+    available = []
+    for candidate in pool.subnets(new_prefix=28):
+        if not any(candidate.overlaps(other) for other in occupied):
+            available.append(str(candidate))
+            if len(available) == len(NETWORK_ROLES):
+                return dict(zip(NETWORK_ROLES, available))
+    raise RuntimeError('App network subnet pool is exhausted; choose another unused RFC1918 pool')
+
+
 @dataclasses.dataclass(frozen=True)
 class Config:
     slug: str
@@ -57,8 +88,10 @@ class Config:
     bugzero_widget_url: str = ''
     app_id: str = ''
     repo_url: str = ''
+    network_pool: str = '10.240.0.0/16'
 
     def __post_init__(self):
+        network_pool(self.network_pool)
         if self.app_id or self.repo_url:
             try:
                 if str(uuid.UUID(self.app_id)) != self.app_id:
@@ -153,6 +186,134 @@ class Deployment:
         os.chmod(c.app_dir, 0o700)
         c.sites_dir.mkdir(parents=True, exist_ok=True)
 
+    def checked_network_path(self, path, *, missing=False):
+        path = Path(path)
+        for ancestor in [self.config.state_root, path.parent]:
+            info = ancestor.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+                raise RuntimeError('Untrusted app network reservation directory or symlink')
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if missing:
+                return None
+            raise RuntimeError('Missing app network reservation') from None
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077):
+            raise RuntimeError('Untrusted app network reservation or lock: require a private owned regular file without links')
+        return info
+
+    def read_network_reservation(self, directory):
+        path = directory / 'network-subnets.json'
+        if self.checked_network_path(path, missing=True) is None:
+            return None
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            with os.fdopen(fd, 'r') as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 16384:
+                    raise ValueError()
+                record = json.load(source)
+            if set(record) != {'version', 'app_name', 'app_id', 'pool', 'subnets'} or record['version'] != 1 or record['app_name'] != directory.name:
+                raise ValueError()
+            if not isinstance(record['app_id'], str) or (record['app_id'] and str(uuid.UUID(record['app_id'])) != record['app_id']):
+                raise ValueError()
+            pool = network_pool(record['pool'])
+            if set(record['subnets']) != set(NETWORK_ROLES):
+                raise ValueError()
+            subnets = [ipaddress.ip_network(record['subnets'][role], strict=True) for role in NETWORK_ROLES]
+            if any(subnet.version != 4 or subnet.prefixlen != 28 or not subnet.subnet_of(pool)
+                   or str(subnet) != record['subnets'][role] for role, subnet in zip(NETWORK_ROLES, subnets)):
+                raise ValueError()
+            if len(set(subnets)) != 3:
+                raise ValueError()
+            return record
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise RuntimeError('Invalid persisted app network reservation; manual repair required') from None
+
+    def prepared_network_subnets(self):
+        record = self.read_network_reservation(self.config.app_dir)
+        if record is None:
+            return {}
+        if record['app_id'] != self.config.app_id or record['pool'] != self.config.network_pool:
+            raise RuntimeError('Persisted app network reservation identity or pool changed')
+        return record['subnets']
+
+    def allocate_networks(self):
+        """Called under deploy.lock; reserve before Compose creates any network.
+
+        Every app shares this kernel lock. Persisted reservations survive crashes,
+        absent Docker resources, so concurrent apps never race for
+        the same small subnet. Docker's daemon-wide address pool is unchanged.
+        """
+        c = self.config
+        lock_path = c.state_root / '.network-allocation.lock'
+        self.checked_network_path(lock_path, missing=True)
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        with os.fdopen(fd, 'r+') as lock:
+            self.checked_network_path(lock_path)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            existing = self.prepared_network_subnets()
+            occupied = []
+            for directory in c.state_root.iterdir():
+                if directory.is_symlink():
+                    raise RuntimeError('Refusing symlink network reservation directory')
+                if not directory.is_dir() or directory == c.app_dir:
+                    continue
+                record = self.read_network_reservation(directory)
+                if record is not None:
+                    occupied.extend(record['subnets'].values())
+            identifiers = self.runner(['docker', 'network', 'ls', '--quiet', '--no-trunc']).stdout.split()
+            networks = json.loads(self.runner(['docker', 'network', 'inspect', *identifiers]).stdout) if identifiers else []
+            routes = json.loads(self.runner(['ip', '-j', '-4', 'route', 'show', 'table', 'all']).stdout)
+            if not isinstance(networks, list) or not isinstance(routes, list):
+                raise RuntimeError('Invalid Docker network or host route inventory')
+            prefix = f'bugzero-{c.slug}'
+            expected = {f'{prefix}-database': ('database', f'{prefix}-data', 'database'),
+                        **{f'{prefix}-{slot}_default': (slot, f'{prefix}-{slot}', 'default') for slot in ('blue', 'green')}}
+            projects = {value[1] for value in expected.values()}
+            owned = []
+            for network in networks:
+                labels = network.get('Labels') or {}
+                wanted = expected.get(network.get('Name'))
+                subnets = [ipaddress.ip_network(entry['Subnet'], strict=False)
+                           for entry in (network.get('IPAM') or {}).get('Config') or [] if entry.get('Subnet')]
+                ipv4 = [subnet for subnet in subnets if subnet.version == 4]
+                if wanted is not None or labels.get('com.docker.compose.project') in projects:
+                    if (wanted is None or network.get('Driver') != 'bridge'
+                            or (labels.get('com.docker.compose.project'), labels.get('com.docker.compose.network')) != wanted[1:]):
+                        raise RuntimeError('Existing app network has foreign ownership labels or name')
+                    if not existing:
+                        raise RuntimeError('Existing app network has no persisted subnet reservation')
+                    if len(ipv4) != 1 or str(ipv4[0]) != existing[wanted[0]]:
+                        raise RuntimeError('Existing app network subnet does not match its persisted reservation')
+                    bridge = (network.get('Options') or {}).get('com.docker.network.bridge.name') or 'br-' + network['Id'][:12]
+                    owned.append((ipv4[0], bridge))
+                else:
+                    occupied.extend(str(subnet) for subnet in ipv4)
+            for route in routes:
+                destination = route.get('dst', 'default')
+                if destination in ('default', '0.0.0.0/0'):
+                    continue
+                subnet = ipaddress.ip_network(destination, strict=False)
+                if subnet.version != 4 or subnet.prefixlen == 0:
+                    continue
+                # Docker installs connected/local routes for each existing app
+                # bridge. Only routes within that exact owned subnet are safe.
+                if any(route.get('dev') == bridge and subnet.subnet_of(own) for own, bridge in owned):
+                    continue
+                occupied.append(str(subnet))
+            if existing:
+                if any(ipaddress.ip_network(value).overlaps(ipaddress.ip_network(other))
+                       for value in existing.values() for other in occupied):
+                    raise RuntimeError('Persisted app network subnet overlaps another reservation, Docker network or host route')
+                return existing
+            subnets = choose_network_subnets(c.network_pool, occupied)
+            atomic_write(c.app_dir / 'network-subnets.json', json.dumps({
+                'version': 1, 'app_name': c.slug, 'app_id': c.app_id, 'pool': c.network_pool,
+                'subnets': subnets}, sort_keys=True) + '\n')
+            return subnets
+
     def database_environment(self):
         c = self.config
         if c.database_env.exists():
@@ -166,6 +327,12 @@ class Deployment:
             password = secrets.token_urlsafe(48)
             values = {'SLUG': c.slug, 'POSTGRES_PASSWORD': password,
                       'DATABASE_URL': f'postgres://app:{password}@db:5432/app'}
+            atomic_write(c.database_env, ''.join(f'{key}={value}\n' for key, value in values.items()))
+        subnets = self.prepared_network_subnets()
+        if subnets:
+            if values.get('APP_DATABASE_SUBNET', subnets['database']) != subnets['database']:
+                raise RuntimeError('Persisted database subnet changed; manual repair required')
+            values['APP_DATABASE_SUBNET'] = subnets['database']
             atomic_write(c.database_env, ''.join(f'{key}={value}\n' for key, value in values.items()))
         self.secret_values = [values['POSTGRES_PASSWORD'], values['DATABASE_URL']]
         return values
@@ -190,6 +357,9 @@ class Deployment:
             'WEB_IMAGE': f'bugzero-{c.slug}-web:{c.revision}',
             'APP_CONFIG_PATH': str(config_file), 'RELEASE_MANIFEST_PATH': str(manifest),
         }
+        subnets = self.prepared_network_subnets()
+        if subnets:
+            values['APP_SLOT_SUBNET'] = subnets[slot]
         atomic_write(directory / 'runtime.env', ''.join(f'{key}={value}\n' for key, value in values.items()))
         return values
 
@@ -307,6 +477,7 @@ class Deployment:
             fcntl.flock(lock, fcntl.LOCK_EX)
             # Recheck ownership after acquiring the per-app deployment lock.
             self.preflight()
+            self.allocate_networks()
             self.database_environment()
             current_file = c.app_dir / 'current.json'
             previous = json.loads(current_file.read_text()) if current_file.exists() else None
@@ -356,7 +527,8 @@ def main():
     c = Config(slug=os.environ.get('APP_NAME', ''), domain=os.environ.get('APP_DOMAIN', ''),
                display_name=os.environ.get('APP_DISPLAY_NAME', ''), revision=os.environ.get('APP_REVISION', ''),
                bugzero_app_key=os.environ.get('BUGZERO_APP_KEY', ''), bugzero_widget_url=os.environ.get('BUGZERO_WIDGET_URL', ''),
-               app_id=os.environ.get('APP_ID', ''), repo_url=os.environ.get('APP_REPOSITORY', ''))
+               app_id=os.environ.get('APP_ID', ''), repo_url=os.environ.get('APP_REPOSITORY', ''),
+               network_pool=os.environ.get('BUGZERO_NETWORK_POOL', '10.240.0.0/16'))
     if not c.app_id or not c.repo_url:
         raise RuntimeError('Managed deployment requires APP_ID and APP_REPOSITORY from BugZero')
     if 'import /etc/caddy/sites/*.caddy' not in c.caddy_config.read_text():

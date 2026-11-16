@@ -27,3 +27,6 @@ networks:
   database:
     name: bugzero-${SLUG:?app slug required}-database
     internal: true
+    ipam:
+      config:
+        - subnet: ${APP_DATABASE_SUBNET:?reserved database subnet required}

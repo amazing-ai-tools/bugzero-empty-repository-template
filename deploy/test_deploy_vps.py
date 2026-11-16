@@ -190,7 +190,13 @@ class DeploymentTests(unittest.TestCase):
                     pass
                 def switch_site(self, port, commit):
                     raise module.RollbackFailed('Caddy rollback reload failed')
-            deploy = FailedRollback(config)
+            def network_inventory(command, **kwargs):
+                if command[:3] == ['docker', 'network', 'ls']:
+                    return SimpleNamespace(stdout='')
+                if command[0] == 'ip':
+                    return SimpleNamespace(stdout='[]')
+                self.fail(f'Unexpected infrastructure command: {command}')
+            deploy = FailedRollback(config, runner=network_inventory)
             deploy.preflight()
             (config.app_dir / 'current.json').write_text(json.dumps({'slot': 'blue', 'revision': 'b' * 40}))
             with self.assertRaises(module.RollbackFailed):

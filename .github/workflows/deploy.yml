@@ -29,6 +29,7 @@ jobs:
       APP_DISPLAY_NAME: ${{ vars.APP_DISPLAY_NAME }}
       APP_ID: ${{ vars.APP_ID }}
       APP_REPOSITORY: https://github.com/${{ github.repository }}
+      BUGZERO_NETWORK_POOL: ${{ vars.BUGZERO_NETWORK_POOL || '10.240.0.0/16' }}
       BUGZERO_APP_KEY: ${{ vars.BUGZERO_APP_KEY }}
       BUGZERO_WIDGET_URL: ${{ vars.BUGZERO_WIDGET_URL }}
     steps:
@@ -55,18 +56,19 @@ jobs:
           module.Config(slug=os.environ['APP_NAME'], domain=os.environ['APP_DOMAIN'],
                         display_name=os.environ['APP_DISPLAY_NAME'], revision=revision,
                         app_id=os.environ['APP_ID'], repo_url=os.environ['APP_REPOSITORY'],
+                        network_pool=os.environ['BUGZERO_NETWORK_POOL'],
                         bugzero_app_key=os.environ['BUGZERO_APP_KEY'], bugzero_widget_url=os.environ['BUGZERO_WIDGET_URL'])
           PY
       - name: Verify deployment safety checks
         run: python3 -m unittest discover -s deploy -p 'test_*.py'
       - name: Build exact revision API and WebAssembly images on VPS
         run: |
-          sudo -n env APP_NAME="$APP_NAME" APP_DOMAIN="$APP_DOMAIN" APP_DISPLAY_NAME="$APP_DISPLAY_NAME" APP_REVISION="$TARGET_SHA" APP_ID="$APP_ID" APP_REPOSITORY="$APP_REPOSITORY" python3 deploy/deploy-vps.py --preflight-only
+          sudo -n env APP_NAME="$APP_NAME" APP_DOMAIN="$APP_DOMAIN" APP_DISPLAY_NAME="$APP_DISPLAY_NAME" APP_REVISION="$TARGET_SHA" APP_ID="$APP_ID" APP_REPOSITORY="$APP_REPOSITORY" BUGZERO_NETWORK_POOL="$BUGZERO_NETWORK_POOL" python3 deploy/deploy-vps.py --preflight-only
           docker build --pull --file rust/backend/Dockerfile --tag "bugzero-${APP_NAME}-api:${TARGET_SHA}" .
           docker build --pull --file rust/frontend/Dockerfile --tag "bugzero-${APP_NAME}-web:${TARGET_SHA}" .
       - name: Back up database, migrate, and promote healthy candidate
         run: |
-          sudo -n env APP_NAME="$APP_NAME" APP_DOMAIN="$APP_DOMAIN" APP_DISPLAY_NAME="$APP_DISPLAY_NAME" APP_REVISION="$TARGET_SHA" APP_ID="$APP_ID" APP_REPOSITORY="$APP_REPOSITORY" BUGZERO_APP_KEY="$BUGZERO_APP_KEY" BUGZERO_WIDGET_URL="$BUGZERO_WIDGET_URL" python3 deploy/deploy-vps.py
+          sudo -n env APP_NAME="$APP_NAME" APP_DOMAIN="$APP_DOMAIN" APP_DISPLAY_NAME="$APP_DISPLAY_NAME" APP_REVISION="$TARGET_SHA" APP_ID="$APP_ID" APP_REPOSITORY="$APP_REPOSITORY" BUGZERO_NETWORK_POOL="$BUGZERO_NETWORK_POOL" BUGZERO_APP_KEY="$BUGZERO_APP_KEY" BUGZERO_WIDGET_URL="$BUGZERO_WIDGET_URL" python3 deploy/deploy-vps.py
       - name: Verify exact public release
         run: |
           python3 - <<'PY'

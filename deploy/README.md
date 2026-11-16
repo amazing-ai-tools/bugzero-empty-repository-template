@@ -14,6 +14,23 @@ Dispatch `.github/workflows/deploy.yml` manually with `target_sha` set to a full
 
 `/opt/bugzero-apps/<slug>` belongs to this app. The script generates the PostgreSQL password once and stores it in a root-only `database.env`; no database password is sent through GitHub variables or logs. PostgreSQL has its own internal Docker network and persistent named volume, with no host port. Only the frontend has a loopback port, which Caddy proxies over HTTPS. The frontend accesses `/api/` on the same origin, so no cross-origin credentials are required.
 
+Each app reserves three `/28` IPv4 networks in a private `network-subnets.json`
+for its database, blue slot and green slot. Deployment uses explicit Compose
+IPAM subnets, avoiding exhaustion of Docker's shared default address pools.
+Allocation holds `/opt/bugzero-apps/.network-allocation.lock`, checks all Docker
+subnets, host routes and other apps' saved reservations, then persists the
+reservation before creating any networks. Existing networks must retain their
+exact app ownership labels and reserved subnet. The default pool is
+`10.240.0.0/16`; an operator can set the optional repository variable
+`BUGZERO_NETWORK_POOL` to a different unused canonical RFC1918 pool before an
+app's first deployment. A configured pool must have room for three `/28`s.
+Changing an existing reservation or pool requires manual reconciliation and is
+refused during deployment. Saved app reservations continue blocking allocation
+when their Docker networks are absent. Retirement archives the reservation only
+after verified resource removal; those subnets can then be reused once Docker
+networks and host routes are gone. Docker daemon settings and other applications'
+networks are never changed.
+
 Each release mounts public `app-config.json` and `qa-release-manifest.json` metadata containing its exact Git revision. WebAssembly files have hashed names; runtime configuration and release metadata are never cached. The public widget key is loaded by the frontend from runtime configuration, while database credentials remain server-side.
 
 Deployment locks serialize one app's release and all Caddy reloads. An app owns only `bugzero-<slug>.caddy`, identified by a matching ownership marker. A preexisting site without that marker is rejected. The main Caddyfile and other applications' site files are never rewritten.
