@@ -1,0 +1,17 @@
+[workspace]
+members = ["rust/backend", "rust/frontend"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93.1"
+license = "MIT"
+
+[profile.release]
+lto = "thin"
+strip = true
+
+# wasm-bindgen needs target_features metadata before Trunk runs wasm-opt.
+[profile.release.package.app-web]
+strip = false

@@ -1,0 +1,77 @@
+name: Rust CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Pull requests never execute on a production VPS runner. Manual runs and
+    # pushes use the protected main ref and the app's provisioned runner label.
+    if: github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && vars.RUNNER_LABEL != '')
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || format('["self-hosted","linux","{0}"]', vars.RUNNER_LABEL || 'vps-template-rust')) }}
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: template
+          POSTGRES_PASSWORD: template-test
+          POSTGRES_DB: template_test
+        ports:
+          - '127.0.0.1::5432'
+        options: >-
+          --health-cmd "pg_isready -U template -d template_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      CARGO_TERM_COLOR: always
+      TEST_DATABASE_URL: postgres://template:template-test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/template_test
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs -o "$RUNNER_TEMP/rustup-init.sh"
+            sh "$RUNNER_TEMP/rustup-init.sh" -y --profile minimal --default-toolchain 1.93.1
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup toolchain install 1.93.1 --profile minimal --component rustfmt,clippy --target wasm32-unknown-unknown
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint API
+        run: cargo clippy --locked -p app-api --all-targets -- -D warnings
+      - name: Test API
+        run: cargo test --locked -p app-api
+      - name: Test public widget configuration
+        run: cargo test --locked -p app-web --lib
+      - name: Test migrations and PostgreSQL readiness
+        run: cargo test --locked -p app-api --test health -- --ignored
+      - name: Test deployment safeguards
+        run: python3 -m unittest discover -s deploy -p 'test_*.py'
+      - name: Build API
+        run: cargo build --locked --release -p app-api
+      - name: Lint WebAssembly frontend
+        run: cargo clippy --locked -p app-web --target wasm32-unknown-unknown -- -D warnings
+      - name: Install pinned Trunk
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/trunk-bin"
+          sh deploy/install-trunk.sh "$RUNNER_TEMP/trunk-bin"
+          echo "$RUNNER_TEMP/trunk-bin" >> "$GITHUB_PATH"
+      - name: Build WebAssembly frontend
+        run: trunk build --config rust/frontend/Trunk.toml --release --locked
