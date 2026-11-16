@@ -36,7 +36,8 @@ jobs:
           --health-retries 10
     env:
       CARGO_TERM_COLOR: always
-      TEST_DATABASE_URL: postgres://template:template-test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/template_test
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -60,6 +61,8 @@ jobs:
       - name: Test public widget configuration
         run: cargo test --locked -p app-web --lib
       - name: Test migrations and PostgreSQL readiness
+        env:
+          TEST_DATABASE_URL: postgres://template:template-test@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/template_test
         run: cargo test --locked -p app-api --test health -- --ignored
       - name: Test deployment safeguards
         run: python3 -m unittest discover -s deploy -p 'test_*.py'
