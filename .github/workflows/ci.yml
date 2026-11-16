@@ -76,8 +76,42 @@ jobs:
           mkdir -p "$RUNNER_TEMP/trunk-bin"
           sh deploy/install-trunk.sh "$RUNNER_TEMP/trunk-bin"
           echo "$RUNNER_TEMP/trunk-bin" >> "$GITHUB_PATH"
+      - name: Remove completed debug build artifacts on VPS
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import shutil
+          workspace = Path.cwd()
+          assert (workspace / 'Cargo.toml').is_file()
+          for relative in ['target/debug', 'target/wasm32-unknown-unknown/debug']:
+              target = workspace / relative
+              if target.exists():
+                  assert target.is_dir() and not target.is_symlink()
+                  assert target.resolve() == target
+                  shutil.rmtree(target)
+          print('Removed completed debug outputs; release build inputs retained.')
+          PYTHON
       - name: Build WebAssembly frontend
         run: trunk build --config rust/frontend/Trunk.toml --release --locked
+      - name: Remove completed Cargo build artifacts on VPS
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import shutil
+          workspace = Path.cwd()
+          target = workspace / 'target'
+          assert (workspace / 'Cargo.toml').is_file()
+          assert (workspace / 'rust/frontend/dist/index.html').is_file()
+          if target.exists():
+              assert target.is_dir() and not target.is_symlink()
+              assert target.resolve() == target
+              shutil.rmtree(target)
+          print('Removed completed Cargo outputs; source and browser bundle retained.')
+          PYTHON
       - name: Install Node for browser tests
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
