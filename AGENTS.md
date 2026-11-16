@@ -26,3 +26,10 @@ BugZero controls model defaults. Preserve GPT 6.1 as the default for new apps,
 chats and threads, and preserve explicit selections and existing conversations.
 The application skeleton does not hardcode AI provider or model settings.
 
+
+The starter UI supports en, fr and pt. Keep every template-owned string in the
+typed `rust/frontend/src/i18n.rs` catalog and supply all three translations.
+Preserve the header selector, browser/saved preference resolution, document
+language and storage-denial fallback. Run frontend native tests with
+`cargo test --locked -p app-web --lib --tests` and the compiled browser checks
+in `tests/browser.cjs` as documented in README.

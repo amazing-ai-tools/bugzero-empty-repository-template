@@ -57,6 +57,7 @@ dependencies = [
  "leptos",
  "serde",
  "url",
+ "web-sys",
 ]
 
 [[package]]
