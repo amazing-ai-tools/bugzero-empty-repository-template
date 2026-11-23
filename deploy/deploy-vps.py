@@ -89,9 +89,12 @@ class Config:
     app_id: str = ''
     repo_url: str = ''
     network_pool: str = '10.240.0.0/16'
+    ingress_http_port: int | None = None
 
     def __post_init__(self):
         network_pool(self.network_pool)
+        if self.ingress_http_port is not None and not 1 <= self.ingress_http_port <= 65535:
+            raise ValueError('The app ingress HTTP port must be between 1 and 65535')
         if self.app_id or self.repo_url:
             try:
                 if str(uuid.UUID(self.app_id)) != self.app_id:
@@ -440,7 +443,8 @@ class Deployment:
     def _switch_site(self, port, commit):
         c = self.config
         previous = c.site_path.read_text() if c.site_path.exists() else None
-        candidate = f'{c.ownership_marker}\n{c.domain} {{\n    encode zstd gzip\n    reverse_proxy 127.0.0.1:{int(port)}\n}}\n'
+        address = c.domain if c.ingress_http_port is None else f'http://{c.domain}:{c.ingress_http_port}'
+        candidate = f'{c.ownership_marker}\n{address} {{\n    encode zstd gzip\n    reverse_proxy 127.0.0.1:{int(port)}\n}}\n'
         # Persist before touching routing so even a later disk failure or process crash blocks retries.
         atomic_write(c.recovery_marker, json.dumps({'reason': 'promotion_in_progress', 'candidate_revision': c.revision,
                                                   'candidate_port': int(port)}) + '\n')
@@ -524,11 +528,14 @@ def main():
     if os.geteuid() != 0:
         raise RuntimeError('Run on the VPS with sudo -n; app state and Caddy configuration require root ownership')
     os.umask(0o077)
+    ingress_file = Path('/etc/bugzero/app-ingress-http-port')
+    ingress_port = int(ingress_file.read_text().strip()) if ingress_file.exists() else None
     c = Config(slug=os.environ.get('APP_NAME', ''), domain=os.environ.get('APP_DOMAIN', ''),
                display_name=os.environ.get('APP_DISPLAY_NAME', ''), revision=os.environ.get('APP_REVISION', ''),
                bugzero_app_key=os.environ.get('BUGZERO_APP_KEY', ''), bugzero_widget_url=os.environ.get('BUGZERO_WIDGET_URL', ''),
                app_id=os.environ.get('APP_ID', ''), repo_url=os.environ.get('APP_REPOSITORY', ''),
-               network_pool=os.environ.get('BUGZERO_NETWORK_POOL', '10.240.0.0/16'))
+               network_pool=os.environ.get('BUGZERO_NETWORK_POOL', '10.240.0.0/16'),
+               ingress_http_port=ingress_port)
     if not c.app_id or not c.repo_url:
         raise RuntimeError('Managed deployment requires APP_ID and APP_REPOSITORY from BugZero')
     if 'import /etc/caddy/sites/*.caddy' not in c.caddy_config.read_text():

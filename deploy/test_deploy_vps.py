@@ -29,6 +29,15 @@ class DeploymentTests(unittest.TestCase):
         (config.app_dir / 'ownership.json').chmod(0o600)
         return config
 
+    def test_vm_site_uses_the_configured_http_listener(self):
+        with tempfile.TemporaryDirectory() as root:
+            config = self.config(root, ingress_http_port=8080)
+            deployment = module.Deployment(config, runner=lambda *args: None,
+                                           reload_caddy=lambda: None, verify_public=lambda: None)
+            deployment.preflight()
+            deployment.switch_site(10001)
+            self.assertIn('http://sample.example.com:8080 {', config.site_path.read_text())
+
     def test_managed_deploy_requires_matching_host_identity(self):
         with tempfile.TemporaryDirectory() as root:
             config = self.managed_config(root)
